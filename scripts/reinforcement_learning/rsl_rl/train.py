@@ -9,6 +9,7 @@
 
 import argparse
 import sys
+from typing import Any, cast
 
 from isaaclab.app import AppLauncher
 
@@ -97,6 +98,7 @@ from isaaclab.utils.io import dump_yaml
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper, handle_deprecated_rsl_rl_cfg
 
 import isaaclab_tasks  # noqa: F401
+from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
@@ -114,6 +116,19 @@ torch.backends.cudnn.benchmark = False
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Train with RSL-RL agent."""
+    # Support YAML agent configs by merging the parsed dict into the default object config.
+    if isinstance(agent_cfg, dict):
+        yaml_agent_cfg = agent_cfg
+        yaml_env_cfg = yaml_agent_cfg.pop("env", None)
+        if yaml_env_cfg is not None:
+            cast(Any, env_cfg).from_dict(yaml_env_cfg)
+        default_agent_cfg = load_cfg_from_registry(args_cli.task, "rsl_rl_cfg_entry_point")
+        if isinstance(default_agent_cfg, dict):
+            raise TypeError("Expected object-based RSL-RL default config for conversion from YAML overrides.")
+        merged_agent_cfg = cast(Any, default_agent_cfg)
+        merged_agent_cfg.from_dict(yaml_agent_cfg)
+        agent_cfg = cast(RslRlBaseRunnerCfg, merged_agent_cfg)
+
     # override configurations with non-hydra CLI arguments
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
@@ -149,8 +164,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
     print(f"[INFO] Logging experiment in directory: {log_root_path}")
-    # specify directory for logging runs: {time-stamp}_{run_name}
-    log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    # specify directory for logging runs: {prefix}_{time-stamp}_{run_name}
+    log_dir_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_dir_prefix_parts = []
+    algorithm_cfg = getattr(agent_cfg, "algorithm", None)
+    algorithm_class_name = getattr(algorithm_cfg, "class_name", None)
+    if algorithm_class_name:
+        log_dir_prefix_parts.append(str(algorithm_class_name))
+    env_decimation = getattr(env_cfg, "decimation", None)
+    if env_decimation is not None:
+        log_dir_prefix_parts.append(f"dec{env_decimation}")
+    log_dir = log_dir_timestamp
+    if log_dir_prefix_parts:
+        log_dir = "_".join(log_dir_prefix_parts + [log_dir_timestamp])
     # The Ray Tune workflow extracts experiment name using the logging line below, hence, do not
     # change it (see PR #2346, comment-2819298849)
     print(f"Exact experiment name requested from command line: {log_dir}")
