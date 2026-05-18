@@ -24,6 +24,8 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:AntPPORunnerCfg",
         "rsl_rl_yaml_cfg_entry_point": f"{agents.__name__}:rsl_rl_ppo_cfg.yaml",
         "rsl_rl_play_yaml_cfg_entry_point": f"{agents.__name__}:rsl_rl_play_cfg.yaml",
+        "rsl_rl_oderl_cfg_entry_point": "oderl.configs:rsl_rl_oderl_ant.yaml",
+        "rsl_rl_oderl_play_cfg_entry_point": "oderl.configs:rsl_rl_oderl_ant_play.yaml",
         "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_cfg.yaml",
         "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg.yaml",
         "sb3_cfg_entry_point": f"{agents.__name__}:sb3_ppo_cfg.yaml",
