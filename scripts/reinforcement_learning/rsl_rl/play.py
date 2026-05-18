@@ -9,6 +9,7 @@
 
 import argparse
 import sys
+from typing import Any, cast
 
 from isaaclab.app import AppLauncher
 
@@ -28,6 +29,18 @@ parser.add_argument(
     "--agent", type=str, default="rsl_rl_cfg_entry_point", help="Name of the RL agent configuration entry point."
 )
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
+parser.add_argument(
+    "--metrics_steps",
+    type=int,
+    default=1000,
+    help="Number of environment steps for play metrics. Set <= 0 to run continuously.",
+)
+parser.add_argument(
+    "--metrics_report_interval",
+    type=int,
+    default=200,
+    help="Print intermediate metrics every N environment steps.",
+)
 parser.add_argument(
     "--use_pretrained_checkpoint",
     action="store_true",
@@ -54,6 +67,7 @@ simulation_app = app_launcher.app
 """Check for installed RSL-RL version."""
 
 import importlib.metadata as metadata
+import statistics
 
 from packaging import version
 
@@ -63,6 +77,7 @@ installed_version = metadata.version("rsl-rl-lib")
 
 import os
 import time
+from collections import deque
 
 import gymnasium as gym
 import torch
@@ -88,21 +103,127 @@ from isaaclab_rl.rsl_rl import (
 from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
 
 import isaaclab_tasks  # noqa: F401
+from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 # PLACEHOLDER: Extension template (do not remove this comment)
 
 
+def _init_play_metrics(num_envs: int, device: str | torch.device) -> dict[str, Any]:
+    return {
+        "rewbuffer": deque(maxlen=100),
+        "lenbuffer": deque(maxlen=100),
+        "cur_reward_sum": torch.zeros(num_envs, dtype=torch.float, device=device),
+        "cur_episode_length": torch.zeros(num_envs, dtype=torch.float, device=device),
+        "ep_extras": [],
+    }
+
+
+def _update_play_metrics(metrics: dict[str, Any], rewards: torch.Tensor, dones: torch.Tensor, extras: dict) -> torch.Tensor:
+    if "episode" in extras:
+        cast(list[dict], metrics["ep_extras"]).append(extras["episode"])
+    elif "log" in extras:
+        cast(list[dict], metrics["ep_extras"]).append(extras["log"])
+
+    if rewards.ndim > 1:
+        rewards = rewards.squeeze(-1)
+    if dones.ndim > 1:
+        dones = dones.squeeze(-1)
+
+    cur_reward_sum = cast(torch.Tensor, metrics["cur_reward_sum"])
+    cur_episode_length = cast(torch.Tensor, metrics["cur_episode_length"])
+    rewbuffer = cast(deque, metrics["rewbuffer"])
+    lenbuffer = cast(deque, metrics["lenbuffer"])
+
+    cur_reward_sum += rewards
+    cur_episode_length += 1
+
+    dones = dones.reshape(-1)
+    new_ids = (dones > 0).nonzero(as_tuple=False).squeeze(-1)
+    if new_ids.numel() > 0:
+        rewbuffer.extend(cur_reward_sum[new_ids].detach().cpu().tolist())
+        lenbuffer.extend(cur_episode_length[new_ids].detach().cpu().tolist())
+        cur_reward_sum[new_ids] = 0
+        cur_episode_length[new_ids] = 0
+
+    return dones
+
+
+def _compute_episode_extras_mean(ep_extras: list[dict], device: str | torch.device) -> dict[str, float]:
+    if not ep_extras:
+        return {}
+
+    extras_mean: dict[str, float] = {}
+    for key in ep_extras[0]:
+        infotensor = torch.tensor([], device=device)
+        for ep_info in ep_extras:
+            if key not in ep_info:
+                continue
+            value = ep_info[key]
+            if not isinstance(value, torch.Tensor):
+                value = torch.tensor([value])
+            if len(value.shape) == 0:
+                value = value.unsqueeze(0)
+            infotensor = torch.cat((infotensor, value.to(device)))
+        if infotensor.numel() > 0:
+            extras_mean[key] = torch.mean(infotensor).item()
+    return extras_mean
+
+
+def _print_train_like_metrics(metrics: dict[str, Any], step: int, device: str | torch.device, clear_extras: bool = True):
+    rewbuffer = cast(deque, metrics["rewbuffer"])
+    lenbuffer = cast(deque, metrics["lenbuffer"])
+    ep_extras = cast(list[dict], metrics["ep_extras"])
+
+    print(f"[METRICS][step={step}]")
+    if len(rewbuffer) > 0:
+        print(
+            f"[METRICS] train_like_mean_reward={statistics.mean(rewbuffer):.6f}, "
+            f"train_like_mean_episode_length={statistics.mean(lenbuffer):.6f}, "
+            f"train_like_completed_episodes_in_window={len(rewbuffer)}"
+        )
+    else:
+        print("[METRICS] train_like_mean_reward=nan, train_like_mean_episode_length=nan, no completed episodes yet")
+
+    extras_mean = _compute_episode_extras_mean(ep_extras, device)
+    for key in sorted(extras_mean.keys()):
+        if "/" in key:
+            print(f"[METRICS] {key}={extras_mean[key]:.6f}")
+        else:
+            print(f"[METRICS] mean_episode_{key}={extras_mean[key]:.6f}")
+
+    if clear_extras:
+        ep_extras.clear()
+
+
+def _print_play_metrics_summary(metrics: dict[str, Any], total_steps: int, device: str | torch.device):
+    print("[METRICS][summary]")
+    _print_train_like_metrics(metrics, total_steps, device, clear_extras=False)
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Play with RSL-RL agent."""
+    # Support YAML agent configs by merging parsed dict into the default object config.
+    if isinstance(agent_cfg, dict):
+        yaml_agent_cfg = agent_cfg
+        yaml_env_cfg = yaml_agent_cfg.pop("env", None)
+        if yaml_env_cfg is not None:
+            cast(Any, env_cfg).from_dict(yaml_env_cfg)
+        default_agent_cfg = load_cfg_from_registry(args_cli.task, "rsl_rl_cfg_entry_point")
+        if isinstance(default_agent_cfg, dict):
+            raise TypeError("Expected object-based RSL-RL default config for conversion from YAML overrides.")
+        merged_agent_cfg = cast(Any, default_agent_cfg)
+        merged_agent_cfg.from_dict(yaml_agent_cfg)
+        agent_cfg = cast(RslRlBaseRunnerCfg, merged_agent_cfg)
+
     # grab task name for checkpoint path
     task_name = args_cli.task.split(":")[-1]
     train_task_name = task_name.replace("-Play", "")
 
     # override configurations with non-hydra CLI arguments
-    agent_cfg: RslRlBaseRunnerCfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
+    agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
 
     # handle deprecated configurations
@@ -162,7 +283,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     else:
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
-    runner.load(resume_path)
+    # Use non-strict loading in play mode to tolerate checkpoint/model shape drift
+    # (e.g., extra legacy keys while keeping current inference graph).
+    runner.load(resume_path, strict=False)
 
     # obtain the trained policy for inference
     policy = runner.get_inference_policy(device=env.unwrapped.device)
@@ -170,6 +293,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # export the trained policy to JIT and ONNX formats
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
 
+    policy_nn = None
     if version.parse(installed_version) >= version.parse("4.0.0"):
         # use the new export functions for rsl-rl >= 4.0.0
         runner.export_policy_to_jit(path=export_model_dir, filename="policy.pt")
@@ -198,6 +322,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # reset environment
     obs = env.get_observations()
     timestep = 0
+    play_metrics = _init_play_metrics(env.num_envs, env.unwrapped.device)
+
     # simulate environment
     while simulation_app.is_running():
         start_time = time.time()
@@ -206,14 +332,26 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # agent stepping
             actions = policy(obs)
             # env stepping
-            obs, _, dones, _ = env.step(actions)
+            obs, rewards, dones, extras = env.step(actions)
+            dones = _update_play_metrics(play_metrics, rewards, dones, extras)
+
             # reset recurrent states for episodes that have terminated
             if version.parse(installed_version) >= version.parse("4.0.0"):
                 policy.reset(dones)
             else:
+                assert policy_nn is not None
                 policy_nn.reset(dones)
+
+        timestep += 1
+
+        if args_cli.metrics_steps > 0 and args_cli.metrics_report_interval > 0:
+            if timestep % args_cli.metrics_report_interval == 0:
+                _print_train_like_metrics(play_metrics, timestep, env.unwrapped.device)
+
+        if args_cli.metrics_steps > 0 and timestep >= args_cli.metrics_steps:
+            break
+
         if args_cli.video:
-            timestep += 1
             # Exit the play loop after recording one video
             if timestep == args_cli.video_length:
                 break
@@ -222,6 +360,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         sleep_time = dt - (time.time() - start_time)
         if args_cli.real_time and sleep_time > 0:
             time.sleep(sleep_time)
+
+    _print_play_metrics_summary(play_metrics, timestep, env.unwrapped.device)
 
     # close the simulator
     env.close()
