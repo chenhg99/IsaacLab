@@ -8,6 +8,7 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import copy
 import csv
 import sys
 from typing import Any, cast
@@ -41,6 +42,18 @@ parser.add_argument(
     type=int,
     default=200,
     help="Print intermediate metrics every N environment steps.",
+)
+parser.add_argument(
+    "--metrics_label",
+    type=str,
+    default=None,
+    help="Label used when saving inference metrics, e.g. decimation_4.",
+)
+parser.add_argument(
+    "--inference_decimation",
+    type=int,
+    default=None,
+    help="Override env decimation only for inference/evaluation.",
 )
 parser.add_argument(
     "--use_pretrained_checkpoint",
@@ -149,9 +162,9 @@ def _ensure_model_cfg_containers(agent_cfg: Any, yaml_agent_cfg: dict) -> None:
             setattr(agent_cfg, model_name, model_cfg)
 
 
-def _prune_ode_cfg_for_builtin_models(agent_cfg_dict: dict) -> dict:
-    """Drop external ODE fields before constructing built-in RSL-RL models."""
-    ode_keys = (
+def _prune_unused_model_cfg(agent_cfg_dict: dict) -> dict:
+    """Drop research-model fields that do not apply to the selected model class."""
+    research_keys = {
         "use_ode",
         "ode_layer_index",
         "ode_time",
@@ -161,12 +174,20 @@ def _prune_ode_cfg_for_builtin_models(agent_cfg_dict: dict) -> dict:
         "residual_layer_index",
         "rnn_hidden_dim",
         "rnn_num_layers",
-    )
+    }
+    keep_by_class = {
+        "oderl.models:ODEMLPModel": {"ode_time", "ode_method", "ode_rtol", "ode_atol"},
+        "oderl.models:ODERecurrentModel": {"ode_time", "ode_method", "ode_rtol", "ode_atol"},
+    }
     builtin_models = {"MLPModel", "RNNModel", "CNNModel"}
     for model_name in ("actor", "critic", "student", "teacher"):
         model_cfg = agent_cfg_dict.get(model_name)
-        if isinstance(model_cfg, dict) and model_cfg.get("class_name") in builtin_models:
-            for key in ode_keys:
+        if not isinstance(model_cfg, dict):
+            continue
+        class_name = model_cfg.get("class_name")
+        keep_keys = keep_by_class.get(class_name, set())
+        if class_name in builtin_models or isinstance(class_name, str):
+            for key in research_keys - keep_keys:
                 model_cfg.pop(key, None)
     return agent_cfg_dict
 
@@ -266,15 +287,28 @@ def _print_play_metrics_summary(metrics: dict[str, Any], total_steps: int, devic
     _print_train_like_metrics(metrics, total_steps, device, clear_extras=False)
 
 
+INFERENCE_EXTRA_METRICS = {
+    "Episode_Reward/progress",
+    "Episode_Reward/energy",
+    "Episode_Reward/action_l2",
+    "Episode_Termination/torso_height",
+}
+
+
 def _write_play_metrics_summary(
-    metrics: dict[str, Any], total_steps: int, device: str | torch.device, log_dir: str
+    metrics: dict[str, Any],
+    total_steps: int,
+    device: str | torch.device,
+    log_dir: str,
+    metrics_label: str | None = None,
 ) -> None:
     result_dir = os.path.join(log_dir, "result")
     os.makedirs(result_dir, exist_ok=True)
 
+    phase_name = "inference" if not metrics_label else f"inference/{metrics_label}"
     rows = [
         {
-            "phase": "inference",
+            "phase": phase_name,
             "metric": "inference_steps",
             "value": float(total_steps),
             "statistic": "total_steps",
@@ -287,21 +321,21 @@ def _write_play_metrics_summary(
         rows.extend(
             [
                 {
-                    "phase": "inference",
+                    "phase": phase_name,
                     "metric": "mean_reward",
                     "value": statistics.mean(rewbuffer),
                     "statistic": "mean_completed_episodes_window",
                     "num_points": len(rewbuffer),
                 },
                 {
-                    "phase": "inference",
+                    "phase": phase_name,
                     "metric": "mean_episode_length",
                     "value": statistics.mean(lenbuffer),
                     "statistic": "mean_completed_episodes_window",
                     "num_points": len(lenbuffer),
                 },
                 {
-                    "phase": "inference",
+                    "phase": phase_name,
                     "metric": "completed_episodes",
                     "value": float(len(rewbuffer)),
                     "statistic": "count_window",
@@ -313,9 +347,11 @@ def _write_play_metrics_summary(
     all_ep_extras = cast(list[dict], metrics["all_ep_extras"])
     for key, value in sorted(_compute_episode_extras_mean(all_ep_extras, device).items()):
         metric = key if "/" in key else f"mean_episode_{key}"
+        if metric not in INFERENCE_EXTRA_METRICS:
+            continue
         rows.append(
             {
-                "phase": "inference",
+                "phase": phase_name,
                 "metric": metric,
                 "value": value,
                 "statistic": "mean_all_logged_steps",
@@ -327,7 +363,7 @@ def _write_play_metrics_summary(
     existing_rows = []
     if os.path.isfile(summary_path):
         with open(summary_path, newline="", encoding="utf-8") as f:
-            existing_rows = [row for row in csv.DictReader(f) if row.get("phase") != "inference"]
+            existing_rows = [row for row in csv.DictReader(f) if row.get("phase") != phase_name]
     summary_rows = existing_rows + rows
     with open(summary_path, "w", newline="", encoding="utf-8") as f:
         fieldnames = ["phase", "metric", "value", "statistic", "num_points"]
@@ -341,19 +377,19 @@ def _write_play_metrics_summary(
 def _metric_better_direction(metric: str) -> str:
     metric_lower = metric.lower()
     if "termination" in metric_lower or "torso_height" in metric_lower:
-        return "↓"
+        return "LOW"
     if "reward" in metric_lower or "episode_length" in metric_lower:
-        return "↑"
+        return "HIGH"
     if "loss" in metric_lower or "learning_rate" in metric_lower:
-        return "↓"
+        return "LOW"
     if "perf/collection_time" in metric_lower or "perf/learning_time" in metric_lower:
-        return "↓"
+        return "LOW"
     if "fps" in metric_lower or "progress" in metric_lower or "alive" in metric_lower or "upright" in metric_lower:
-        return "↑"
+        return "HIGH"
     if "energy" in metric_lower or "action_l2" in metric_lower:
-        return "↓"
+        return "LOW"
     if "completed_episodes" in metric_lower:
-        return "↑"
+        return "HIGH"
     return ""
 
 
@@ -396,7 +432,7 @@ def _write_metrics_table(path: str, rows: list[dict]) -> None:
         for row in table_rows:
             f.write(format_row(row) + "\n")
         f.write(line() + "\n")
-        f.write("Legend: ↑ means larger is better; ↓ means smaller is better; blank means direction is task-dependent.\n")
+        f.write("Legend: HIGH means larger is better; LOW means smaller is better; blank means direction is task-dependent.\n")
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -423,6 +459,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # override configurations with non-hydra CLI arguments
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+    if args_cli.inference_decimation is not None:
+        env_cfg.decimation = args_cli.inference_decimation
 
     # handle deprecated configurations
     agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
@@ -475,11 +513,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
     # load previously trained model
-    agent_cfg_dict = _prune_ode_cfg_for_builtin_models(agent_cfg.to_dict())
+    agent_cfg_dict = _prune_unused_model_cfg(agent_cfg.to_dict())
     if agent_cfg.class_name == "OnPolicyRunner":
-        runner = OnPolicyRunner(env, agent_cfg_dict, log_dir=None, device=agent_cfg.device)
+        runner = OnPolicyRunner(env, copy.deepcopy(agent_cfg_dict), log_dir=None, device=agent_cfg.device)
     elif agent_cfg.class_name == "DistillationRunner":
-        runner = DistillationRunner(env, agent_cfg_dict, log_dir=None, device=agent_cfg.device)
+        runner = DistillationRunner(env, copy.deepcopy(agent_cfg_dict), log_dir=None, device=agent_cfg.device)
     else:
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
     # Use non-strict loading in play mode to tolerate checkpoint/model shape drift
@@ -564,7 +602,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             time.sleep(sleep_time)
 
     _print_play_metrics_summary(play_metrics, timestep, env.unwrapped.device)
-    _write_play_metrics_summary(play_metrics, timestep, env.unwrapped.device, log_dir)
+    metrics_label = args_cli.metrics_label
+    if metrics_label is None and args_cli.inference_decimation is not None:
+        metrics_label = f"decimation_{args_cli.inference_decimation}"
+    _write_play_metrics_summary(play_metrics, timestep, env.unwrapped.device, log_dir, metrics_label)
 
     # close the simulator
     env.close()

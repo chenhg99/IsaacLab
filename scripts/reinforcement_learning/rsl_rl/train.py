@@ -76,6 +76,7 @@ if version.parse(installed_version) < version.parse(RSL_RL_VERSION):
 
 """Rest everything follows."""
 
+import copy
 import logging
 import os
 import time
@@ -150,9 +151,9 @@ def _ensure_model_cfg_containers(agent_cfg: Any, yaml_agent_cfg: dict) -> None:
             setattr(agent_cfg, model_name, model_cfg)
 
 
-def _prune_ode_cfg_for_builtin_models(agent_cfg_dict: dict) -> dict:
-    """Drop external ODE fields before constructing built-in RSL-RL models."""
-    ode_keys = (
+def _prune_unused_model_cfg(agent_cfg_dict: dict) -> dict:
+    """Drop research-model fields that do not apply to the selected model class."""
+    research_keys = {
         "use_ode",
         "ode_layer_index",
         "ode_time",
@@ -162,12 +163,20 @@ def _prune_ode_cfg_for_builtin_models(agent_cfg_dict: dict) -> dict:
         "residual_layer_index",
         "rnn_hidden_dim",
         "rnn_num_layers",
-    )
+    }
+    keep_by_class = {
+        "oderl.models:ODEMLPModel": {"ode_time", "ode_method", "ode_rtol", "ode_atol"},
+        "oderl.models:ODERecurrentModel": {"ode_time", "ode_method", "ode_rtol", "ode_atol"},
+    }
     builtin_models = {"MLPModel", "RNNModel", "CNNModel"}
     for model_name in ("actor", "critic", "student", "teacher"):
         model_cfg = agent_cfg_dict.get(model_name)
-        if isinstance(model_cfg, dict) and model_cfg.get("class_name") in builtin_models:
-            for key in ode_keys:
+        if not isinstance(model_cfg, dict):
+            continue
+        class_name = model_cfg.get("class_name")
+        keep_keys = keep_by_class.get(class_name, set())
+        if class_name in builtin_models or isinstance(class_name, str):
+            for key in research_keys - keep_keys:
                 model_cfg.pop(key, None)
     return agent_cfg_dict
 
@@ -284,11 +293,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
     # create runner from rsl-rl
-    agent_cfg_dict = _prune_ode_cfg_for_builtin_models(agent_cfg.to_dict())
+    agent_cfg_dict = _prune_unused_model_cfg(agent_cfg.to_dict())
     if agent_cfg.class_name == "OnPolicyRunner":
-        runner = OnPolicyRunner(env, agent_cfg_dict, log_dir=log_dir, device=agent_cfg.device)
+        runner = OnPolicyRunner(env, copy.deepcopy(agent_cfg_dict), log_dir=log_dir, device=agent_cfg.device)
     elif agent_cfg.class_name == "DistillationRunner":
-        runner = DistillationRunner(env, agent_cfg_dict, log_dir=log_dir, device=agent_cfg.device)
+        runner = DistillationRunner(env, copy.deepcopy(agent_cfg_dict), log_dir=log_dir, device=agent_cfg.device)
     else:
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
     # write git state to logs
@@ -301,7 +310,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
-    dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
+    dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg_dict)
 
     # run training
     runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
