@@ -37,22 +37,22 @@ class RslRlMLPModelCfg:
     distribution_cfg: DistributionCfg | None = None
     """The configuration for the output distribution. Defaults to None, in which case no distribution is used."""
 
-    use_ode: bool = False
+    use_ode: bool = MISSING
     """Whether to insert an ODE block into the MLP model. Defaults to False."""
 
-    ode_layer_index: int = 0
+    ode_layer_index: int = MISSING
     """Hidden layer index after which to insert the ODE block. Defaults to 0."""
 
-    ode_time: float = 0.1
+    ode_time: float = MISSING
     """Final integration time for the ODE block. Defaults to 0.1."""
 
-    ode_method: str = "rk4"
+    ode_method: str = MISSING
     """Integration method passed to torchdiffeq. Defaults to ``rk4``."""
 
-    ode_rtol: float = 1.0e-3
+    ode_rtol: float = MISSING
     """Relative tolerance passed to torchdiffeq. Defaults to 1e-3."""
 
-    ode_atol: float = 1.0e-3
+    ode_atol: float = MISSING
     """Absolute tolerance passed to torchdiffeq. Defaults to 1e-3."""
 
     @configclass

@@ -95,7 +95,7 @@ from isaaclab.envs import (
 from isaaclab.utils.dict import print_dict
 from isaaclab.utils.io import dump_yaml
 
-from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper, handle_deprecated_rsl_rl_cfg
+from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlMLPModelCfg, RslRlVecEnvWrapper, handle_deprecated_rsl_rl_cfg
 
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils.parse_cfg import load_cfg_from_registry
@@ -113,6 +113,52 @@ torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
 
 
+def _ensure_model_cfg_containers(agent_cfg: Any, yaml_agent_cfg: dict) -> None:
+    """Create typed model config containers before merging YAML actor/critic overrides."""
+    for model_name in ("actor", "critic", "student", "teacher"):
+        model_data = yaml_agent_cfg.get(model_name)
+        if not isinstance(model_data, dict):
+            continue
+        if isinstance(getattr(agent_cfg, model_name, None), type(__import__("dataclasses").MISSING)):
+            model_cfg = RslRlMLPModelCfg(
+                hidden_dims=model_data.get("hidden_dims", []),
+                activation=model_data.get("activation", "elu"),
+                obs_normalization=model_data.get("obs_normalization", False),
+            )
+            model_cfg.use_ode = False
+            model_cfg.ode_layer_index = 0
+            model_cfg.ode_time = 0.1
+            model_cfg.ode_method = "rk4"
+            model_cfg.ode_rtol = 1.0e-3
+            model_cfg.ode_atol = 1.0e-3
+            dist_data = model_data.get("distribution_cfg")
+            if isinstance(dist_data, dict):
+                dist_class_name = dist_data.get("class_name", "GaussianDistribution")
+                if dist_class_name == "GaussianDistribution":
+                    model_cfg.distribution_cfg = RslRlMLPModelCfg.GaussianDistributionCfg(
+                        init_std=dist_data.get("init_std", 1.0),
+                        std_type=dist_data.get("std_type", "scalar"),
+                    )
+                elif dist_class_name == "HeteroscedasticGaussianDistribution":
+                    model_cfg.distribution_cfg = RslRlMLPModelCfg.HeteroscedasticGaussianDistributionCfg(
+                        init_std=dist_data.get("init_std", 1.0),
+                        std_type=dist_data.get("std_type", "scalar"),
+                    )
+            setattr(agent_cfg, model_name, model_cfg)
+
+
+def _prune_ode_cfg_for_builtin_models(agent_cfg_dict: dict) -> dict:
+    """Drop external ODE fields before constructing built-in RSL-RL models."""
+    ode_keys = ("use_ode", "ode_layer_index", "ode_time", "ode_method", "ode_rtol", "ode_atol")
+    builtin_models = {"MLPModel", "RNNModel", "CNNModel"}
+    for model_name in ("actor", "critic", "student", "teacher"):
+        model_cfg = agent_cfg_dict.get(model_name)
+        if isinstance(model_cfg, dict) and model_cfg.get("class_name") in builtin_models:
+            for key in ode_keys:
+                model_cfg.pop(key, None)
+    return agent_cfg_dict
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Train with RSL-RL agent."""
@@ -126,6 +172,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if isinstance(default_agent_cfg, dict):
             raise TypeError("Expected object-based RSL-RL default config for conversion from YAML overrides.")
         merged_agent_cfg = cast(Any, default_agent_cfg)
+        _ensure_model_cfg_containers(merged_agent_cfg, yaml_agent_cfg)
         merged_agent_cfg.from_dict(yaml_agent_cfg)
         agent_cfg = cast(RslRlBaseRunnerCfg, merged_agent_cfg)
 
@@ -224,10 +271,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
     # create runner from rsl-rl
+    agent_cfg_dict = _prune_ode_cfg_for_builtin_models(agent_cfg.to_dict())
     if agent_cfg.class_name == "OnPolicyRunner":
-        runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+        runner = OnPolicyRunner(env, agent_cfg_dict, log_dir=log_dir, device=agent_cfg.device)
     elif agent_cfg.class_name == "DistillationRunner":
-        runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+        runner = DistillationRunner(env, agent_cfg_dict, log_dir=log_dir, device=agent_cfg.device)
     else:
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
     # write git state to logs
