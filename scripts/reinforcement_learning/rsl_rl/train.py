@@ -131,6 +131,9 @@ def _ensure_model_cfg_containers(agent_cfg: Any, yaml_agent_cfg: dict) -> None:
             model_cfg.ode_method = "rk4"
             model_cfg.ode_rtol = 1.0e-3
             model_cfg.ode_atol = 1.0e-3
+            model_cfg.residual_layer_index = 0
+            model_cfg.rnn_hidden_dim = 128
+            model_cfg.rnn_num_layers = 1
             dist_data = model_data.get("distribution_cfg")
             if isinstance(dist_data, dict):
                 dist_class_name = dist_data.get("class_name", "GaussianDistribution")
@@ -149,7 +152,17 @@ def _ensure_model_cfg_containers(agent_cfg: Any, yaml_agent_cfg: dict) -> None:
 
 def _prune_ode_cfg_for_builtin_models(agent_cfg_dict: dict) -> dict:
     """Drop external ODE fields before constructing built-in RSL-RL models."""
-    ode_keys = ("use_ode", "ode_layer_index", "ode_time", "ode_method", "ode_rtol", "ode_atol")
+    ode_keys = (
+        "use_ode",
+        "ode_layer_index",
+        "ode_time",
+        "ode_method",
+        "ode_rtol",
+        "ode_atol",
+        "residual_layer_index",
+        "rnn_hidden_dim",
+        "rnn_num_layers",
+    )
     builtin_models = {"MLPModel", "RNNModel", "CNNModel"}
     for model_name in ("actor", "critic", "student", "teacher"):
         model_cfg = agent_cfg_dict.get(model_name)

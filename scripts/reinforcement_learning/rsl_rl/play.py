@@ -8,6 +8,7 @@
 """Launch Isaac Sim Simulator first."""
 
 import argparse
+import csv
 import sys
 from typing import Any, cast
 
@@ -129,6 +130,9 @@ def _ensure_model_cfg_containers(agent_cfg: Any, yaml_agent_cfg: dict) -> None:
             model_cfg.ode_method = "rk4"
             model_cfg.ode_rtol = 1.0e-3
             model_cfg.ode_atol = 1.0e-3
+            model_cfg.residual_layer_index = 0
+            model_cfg.rnn_hidden_dim = 128
+            model_cfg.rnn_num_layers = 1
             dist_data = model_data.get("distribution_cfg")
             if isinstance(dist_data, dict):
                 dist_class_name = dist_data.get("class_name", "GaussianDistribution")
@@ -147,7 +151,17 @@ def _ensure_model_cfg_containers(agent_cfg: Any, yaml_agent_cfg: dict) -> None:
 
 def _prune_ode_cfg_for_builtin_models(agent_cfg_dict: dict) -> dict:
     """Drop external ODE fields before constructing built-in RSL-RL models."""
-    ode_keys = ("use_ode", "ode_layer_index", "ode_time", "ode_method", "ode_rtol", "ode_atol")
+    ode_keys = (
+        "use_ode",
+        "ode_layer_index",
+        "ode_time",
+        "ode_method",
+        "ode_rtol",
+        "ode_atol",
+        "residual_layer_index",
+        "rnn_hidden_dim",
+        "rnn_num_layers",
+    )
     builtin_models = {"MLPModel", "RNNModel", "CNNModel"}
     for model_name in ("actor", "critic", "student", "teacher"):
         model_cfg = agent_cfg_dict.get(model_name)
@@ -164,14 +178,17 @@ def _init_play_metrics(num_envs: int, device: str | torch.device) -> dict[str, A
         "cur_reward_sum": torch.zeros(num_envs, dtype=torch.float, device=device),
         "cur_episode_length": torch.zeros(num_envs, dtype=torch.float, device=device),
         "ep_extras": [],
+        "all_ep_extras": [],
     }
 
 
 def _update_play_metrics(metrics: dict[str, Any], rewards: torch.Tensor, dones: torch.Tensor, extras: dict) -> torch.Tensor:
     if "episode" in extras:
         cast(list[dict], metrics["ep_extras"]).append(extras["episode"])
+        cast(list[dict], metrics["all_ep_extras"]).append(extras["episode"])
     elif "log" in extras:
         cast(list[dict], metrics["ep_extras"]).append(extras["log"])
+        cast(list[dict], metrics["all_ep_extras"]).append(extras["log"])
 
     if rewards.ndim > 1:
         rewards = rewards.squeeze(-1)
@@ -247,6 +264,139 @@ def _print_train_like_metrics(metrics: dict[str, Any], step: int, device: str | 
 def _print_play_metrics_summary(metrics: dict[str, Any], total_steps: int, device: str | torch.device):
     print("[METRICS][summary]")
     _print_train_like_metrics(metrics, total_steps, device, clear_extras=False)
+
+
+def _write_play_metrics_summary(
+    metrics: dict[str, Any], total_steps: int, device: str | torch.device, log_dir: str
+) -> None:
+    result_dir = os.path.join(log_dir, "result")
+    os.makedirs(result_dir, exist_ok=True)
+
+    rows = [
+        {
+            "phase": "inference",
+            "metric": "inference_steps",
+            "value": float(total_steps),
+            "statistic": "total_steps",
+            "num_points": 1,
+        }
+    ]
+    rewbuffer = cast(deque, metrics["rewbuffer"])
+    lenbuffer = cast(deque, metrics["lenbuffer"])
+    if len(rewbuffer) > 0:
+        rows.extend(
+            [
+                {
+                    "phase": "inference",
+                    "metric": "mean_reward",
+                    "value": statistics.mean(rewbuffer),
+                    "statistic": "mean_completed_episodes_window",
+                    "num_points": len(rewbuffer),
+                },
+                {
+                    "phase": "inference",
+                    "metric": "mean_episode_length",
+                    "value": statistics.mean(lenbuffer),
+                    "statistic": "mean_completed_episodes_window",
+                    "num_points": len(lenbuffer),
+                },
+                {
+                    "phase": "inference",
+                    "metric": "completed_episodes",
+                    "value": float(len(rewbuffer)),
+                    "statistic": "count_window",
+                    "num_points": len(rewbuffer),
+                },
+            ]
+        )
+
+    all_ep_extras = cast(list[dict], metrics["all_ep_extras"])
+    for key, value in sorted(_compute_episode_extras_mean(all_ep_extras, device).items()):
+        metric = key if "/" in key else f"mean_episode_{key}"
+        rows.append(
+            {
+                "phase": "inference",
+                "metric": metric,
+                "value": value,
+                "statistic": "mean_all_logged_steps",
+                "num_points": len(all_ep_extras),
+            }
+        )
+
+    summary_path = os.path.join(result_dir, "metrics_summary.csv")
+    existing_rows = []
+    if os.path.isfile(summary_path):
+        with open(summary_path, newline="", encoding="utf-8") as f:
+            existing_rows = [row for row in csv.DictReader(f) if row.get("phase") != "inference"]
+    summary_rows = existing_rows + rows
+    with open(summary_path, "w", newline="", encoding="utf-8") as f:
+        fieldnames = ["phase", "metric", "value", "statistic", "num_points"]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(summary_rows)
+    _write_metrics_table(os.path.join(result_dir, "metrics_summary.txt"), summary_rows)
+    print(f"Saved metrics summary to: {summary_path}")
+
+
+def _metric_better_direction(metric: str) -> str:
+    metric_lower = metric.lower()
+    if "termination" in metric_lower or "torso_height" in metric_lower:
+        return "↓"
+    if "reward" in metric_lower or "episode_length" in metric_lower:
+        return "↑"
+    if "loss" in metric_lower or "learning_rate" in metric_lower:
+        return "↓"
+    if "perf/collection_time" in metric_lower or "perf/learning_time" in metric_lower:
+        return "↓"
+    if "fps" in metric_lower or "progress" in metric_lower or "alive" in metric_lower or "upright" in metric_lower:
+        return "↑"
+    if "energy" in metric_lower or "action_l2" in metric_lower:
+        return "↓"
+    if "completed_episodes" in metric_lower:
+        return "↑"
+    return ""
+
+
+def _write_metrics_table(path: str, rows: list[dict]) -> None:
+    """Write a fixed-width metrics table for quick inspection."""
+    headers = ["phase", "metric", "value", "better", "statistic", "n"]
+    table_rows = []
+    for row in rows:
+        value = row.get("value", "")
+        try:
+            value_text = f"{float(value):.4f}"
+        except (TypeError, ValueError):
+            value_text = str(value)
+        direction = _metric_better_direction(str(row.get("metric", "")))
+        table_rows.append(
+            [
+                str(row.get("phase", "")),
+                str(row.get("metric", "")),
+                value_text,
+                direction,
+                str(row.get("statistic", "")),
+                str(row.get("num_points", "")),
+            ]
+        )
+
+    widths = [len(header) for header in headers]
+    for row in table_rows:
+        widths = [max(width, len(cell)) for width, cell in zip(widths, row)]
+
+    def line(char: str = "-") -> str:
+        return "+" + "+".join(char * (width + 2) for width in widths) + "+"
+
+    def format_row(row: list[str]) -> str:
+        return "|" + "|".join(f" {cell:<{width}} " for cell, width in zip(row, widths)) + "|"
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(line() + "\n")
+        f.write(format_row(headers) + "\n")
+        f.write(line("=") + "\n")
+        for row in table_rows:
+            f.write(format_row(row) + "\n")
+        f.write(line() + "\n")
+        f.write("Legend: ↑ means larger is better; ↓ means smaller is better; blank means direction is task-dependent.\n")
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -414,6 +564,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             time.sleep(sleep_time)
 
     _print_play_metrics_summary(play_metrics, timestep, env.unwrapped.device)
+    _write_play_metrics_summary(play_metrics, timestep, env.unwrapped.device, log_dir)
 
     # close the simulator
     env.close()

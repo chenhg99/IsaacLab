@@ -55,6 +55,15 @@ class RslRlMLPModelCfg:
     ode_atol: float = MISSING
     """Absolute tolerance passed to torchdiffeq. Defaults to 1e-3."""
 
+    residual_layer_index: int = MISSING
+    """Hidden layer index after which to insert a residual block. Defaults to 0."""
+
+    rnn_hidden_dim: int = MISSING
+    """Hidden dimension for recurrent research models. Defaults to 128."""
+
+    rnn_num_layers: int = MISSING
+    """Number of recurrent layers for recurrent research models. Defaults to 1."""
+
     @configclass
     class DistributionCfg:
         """Configuration for the output distribution."""
