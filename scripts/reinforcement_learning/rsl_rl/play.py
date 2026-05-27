@@ -143,6 +143,18 @@ def _ensure_model_cfg_containers(agent_cfg: Any, yaml_agent_cfg: dict) -> None:
             model_cfg.ode_method = "rk4"
             model_cfg.ode_rtol = 1.0e-3
             model_cfg.ode_atol = 1.0e-3
+            model_cfg.ode_steps = 4
+            model_cfg.derivative_scale = 0.1
+            model_cfg.learn_derivative_scale = False
+            model_cfg.derivative_scale_min = 0.05
+            model_cfg.derivative_scale_max = 1.0
+            model_cfg.zero_init_derivative = True
+            model_cfg.use_gate = False
+            model_cfg.gate_bias = -1.0
+            model_cfg.reset_gate_bias = 0.0
+            model_cfg.update_gate_bias = -1.0
+            model_cfg.augment_dim = 64
+            model_cfg.adapter_scale = 1.0
             model_cfg.residual_layer_index = 0
             model_cfg.rnn_hidden_dim = 128
             model_cfg.rnn_num_layers = 1
@@ -171,13 +183,29 @@ def _prune_unused_model_cfg(agent_cfg_dict: dict) -> dict:
         "ode_method",
         "ode_rtol",
         "ode_atol",
+        "ode_steps",
+        "derivative_scale",
+        "learn_derivative_scale",
+        "derivative_scale_min",
+        "derivative_scale_max",
+        "zero_init_derivative",
+        "use_gate",
+        "gate_bias",
+        "augment_dim",
+        "adapter_scale",
         "residual_layer_index",
         "rnn_hidden_dim",
         "rnn_num_layers",
+        "reset_gate_bias",
+        "update_gate_bias",
     }
     keep_by_class = {
         "oderl.models:ODEMLPModel": {"ode_time", "ode_method", "ode_rtol", "ode_atol"},
-        "oderl.models:ODERecurrentModel": {"ode_time", "ode_method", "ode_rtol", "ode_atol"},
+        "oderl.models:ODERecurrentModel": {"ode_time", "ode_method", "ode_rtol", "ode_atol", "use_gate", "gate_bias"},
+        "oderl.models:GatedODERecurrentModel": {"ode_time", "ode_method", "derivative_scale", "learn_derivative_scale", "derivative_scale_min", "derivative_scale_max", "zero_init_derivative", "reset_gate_bias", "update_gate_bias"},
+        "oderl.models:RK4ODEMLPModel": {"ode_time", "ode_steps", "derivative_scale", "zero_init_derivative", "use_gate", "gate_bias"},
+        "oderl.models:AugmentedRK4ODEMLPModel": {"ode_time", "ode_steps", "derivative_scale", "zero_init_derivative", "augment_dim", "use_gate", "gate_bias"},
+        "oderl.models:ODEAdapterMLPModel": {"ode_time", "ode_steps", "derivative_scale", "zero_init_derivative", "adapter_scale", "use_gate", "gate_bias"},
     }
     builtin_models = {"MLPModel", "RNNModel", "CNNModel"}
     for model_name in ("actor", "critic", "student", "teacher"):

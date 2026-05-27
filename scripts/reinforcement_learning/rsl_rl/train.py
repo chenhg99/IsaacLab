@@ -84,6 +84,8 @@ from datetime import datetime
 
 import gymnasium as gym
 import torch
+import torch.nn as nn
+from tensordict import TensorDict
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
 from isaaclab.envs import (
@@ -132,6 +134,18 @@ def _ensure_model_cfg_containers(agent_cfg: Any, yaml_agent_cfg: dict) -> None:
             model_cfg.ode_method = "rk4"
             model_cfg.ode_rtol = 1.0e-3
             model_cfg.ode_atol = 1.0e-3
+            model_cfg.ode_steps = 4
+            model_cfg.derivative_scale = 0.1
+            model_cfg.learn_derivative_scale = False
+            model_cfg.derivative_scale_min = 0.05
+            model_cfg.derivative_scale_max = 1.0
+            model_cfg.zero_init_derivative = True
+            model_cfg.use_gate = False
+            model_cfg.gate_bias = -1.0
+            model_cfg.reset_gate_bias = 0.0
+            model_cfg.update_gate_bias = -1.0
+            model_cfg.augment_dim = 64
+            model_cfg.adapter_scale = 1.0
             model_cfg.residual_layer_index = 0
             model_cfg.rnn_hidden_dim = 128
             model_cfg.rnn_num_layers = 1
@@ -160,13 +174,29 @@ def _prune_unused_model_cfg(agent_cfg_dict: dict) -> dict:
         "ode_method",
         "ode_rtol",
         "ode_atol",
+        "ode_steps",
+        "derivative_scale",
+        "learn_derivative_scale",
+        "derivative_scale_min",
+        "derivative_scale_max",
+        "zero_init_derivative",
+        "use_gate",
+        "gate_bias",
+        "augment_dim",
+        "adapter_scale",
         "residual_layer_index",
         "rnn_hidden_dim",
         "rnn_num_layers",
+        "reset_gate_bias",
+        "update_gate_bias",
     }
     keep_by_class = {
         "oderl.models:ODEMLPModel": {"ode_time", "ode_method", "ode_rtol", "ode_atol"},
-        "oderl.models:ODERecurrentModel": {"ode_time", "ode_method", "ode_rtol", "ode_atol"},
+        "oderl.models:ODERecurrentModel": {"ode_time", "ode_method", "ode_rtol", "ode_atol", "use_gate", "gate_bias"},
+        "oderl.models:GatedODERecurrentModel": {"ode_time", "ode_method", "derivative_scale", "learn_derivative_scale", "derivative_scale_min", "derivative_scale_max", "zero_init_derivative", "reset_gate_bias", "update_gate_bias"},
+        "oderl.models:RK4ODEMLPModel": {"ode_time", "ode_steps", "derivative_scale", "zero_init_derivative", "use_gate", "gate_bias"},
+        "oderl.models:AugmentedRK4ODEMLPModel": {"ode_time", "ode_steps", "derivative_scale", "zero_init_derivative", "augment_dim", "use_gate", "gate_bias"},
+        "oderl.models:ODEAdapterMLPModel": {"ode_time", "ode_steps", "derivative_scale", "zero_init_derivative", "adapter_scale", "use_gate", "gate_bias"},
     }
     builtin_models = {"MLPModel", "RNNModel", "CNNModel"}
     for model_name in ("actor", "critic", "student", "teacher"):
@@ -179,6 +209,125 @@ def _prune_unused_model_cfg(agent_cfg_dict: dict) -> dict:
             for key in research_keys - keep_keys:
                 model_cfg.pop(key, None)
     return agent_cfg_dict
+
+
+def _shape_repr(value: Any) -> str:
+    """Return a compact shape/type representation for hook inputs and outputs."""
+    if isinstance(value, torch.Tensor):
+        return f"Tensor(shape={tuple(value.shape)}, dtype={value.dtype}, device={value.device})"
+    if isinstance(value, TensorDict):
+        items = ", ".join(f"{key}: {tuple(tensor.shape)}" for key, tensor in value.items())
+        return f"TensorDict(batch_size={list(value.batch_size)}, {items})"
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_shape_repr(item) for item in value) + "]"
+    if isinstance(value, dict):
+        return "{" + ", ".join(f"{key}: {_shape_repr(item)}" for key, item in value.items()) + "}"
+    if value is None:
+        return "None"
+    return type(value).__name__
+
+
+def _count_parameters(model: nn.Module) -> tuple[int, int]:
+    total = sum(param.numel() for param in model.parameters())
+    trainable = sum(param.numel() for param in model.parameters() if param.requires_grad)
+    return total, trainable
+
+
+def _small_observation_batch(obs: TensorDict, max_batch: int = 2) -> TensorDict:
+    batch = int(obs.batch_size[0]) if obs.batch_size else max_batch
+    return obs[: min(max_batch, batch)].clone()
+
+
+def _trace_model_shapes(model: nn.Module, obs: TensorDict, name: str) -> list[str]:
+    lines: list[str] = []
+    handles = []
+    old_training = model.training
+    root_id = id(model)
+
+    def register_hooks() -> None:
+        for module_name, module in model.named_modules():
+            label = module_name if module_name else "<root>"
+            if id(module) != root_id and any(module.children()):
+                continue
+
+            def hook(mod: nn.Module, inputs: tuple[Any, ...], output: Any, label: str = label) -> None:
+                lines.append(
+                    f"{label:<45s} {mod.__class__.__name__:<28s} "
+                    f"in={_shape_repr(inputs)} -> out={_shape_repr(output)}"
+                )
+
+            handles.append(module.register_forward_hook(hook))
+
+    try:
+        model.eval()
+        register_hooks()
+        with torch.no_grad():
+            output = model(obs, stochastic_output=False)
+        lines.insert(0, f"{name} final_output: {_shape_repr(output)}")
+    except Exception as exc:
+        lines.append(f"{name} shape trace failed: {type(exc).__name__}: {exc}")
+    finally:
+        for handle in handles:
+            handle.remove()
+        model.train(old_training)
+        reset = getattr(model, "reset", None)
+        if callable(reset):
+            try:
+                reset()
+            except Exception:
+                pass
+    return lines
+
+
+def _save_model_debug_report(runner: Any, env: Any, log_dir: str) -> None:
+    """Save model repr, parameter counts, and one forward-pass shape trace for the current run."""
+    result_dir = os.path.join(log_dir, "result")
+    os.makedirs(result_dir, exist_ok=True)
+    alg = getattr(runner, "alg", None)
+    models = [("actor", getattr(alg, "actor", None)), ("critic", getattr(alg, "critic", None))]
+
+    arch_lines = ["# Model Architecture", ""]
+    trace_lines = ["# Model Shape Trace", "", "This trace uses a small batch from env.get_observations() before training.", ""]
+
+    try:
+        obs = _small_observation_batch(env.get_observations())
+        trace_lines.append(f"input_observation: {_shape_repr(obs)}")
+        trace_lines.append("")
+    except Exception as exc:
+        obs = None
+        trace_lines.append(f"failed_to_get_observations: {type(exc).__name__}: {exc}")
+        trace_lines.append("")
+
+    for name, model in models:
+        if not isinstance(model, nn.Module):
+            continue
+        total, trainable = _count_parameters(model)
+        arch_lines.extend(
+            [
+                f"## {name}",
+                f"class: {model.__class__.__module__}.{model.__class__.__name__}",
+                f"parameters_total: {total}",
+                f"parameters_trainable: {trainable}",
+                "",
+                "```text",
+                repr(model),
+                "```",
+                "",
+            ]
+        )
+        trace_lines.extend([f"## {name}", f"parameters_total: {total}", ""])
+        if obs is not None:
+            trace_lines.extend(_trace_model_shapes(model, obs, name))
+        trace_lines.append("")
+
+    arch_path = os.path.join(result_dir, "model_architecture.txt")
+    trace_path = os.path.join(result_dir, "model_shape_trace.txt")
+    with open(arch_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(arch_lines).rstrip() + "\n")
+    with open(trace_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(trace_lines).rstrip() + "\n")
+    print(f"Saved model architecture to: {arch_path}")
+    print(f"Saved model shape trace to: {trace_path}")
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -311,6 +460,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg_dict)
+    _save_model_debug_report(runner, env, log_dir)
 
     # run training
     runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
